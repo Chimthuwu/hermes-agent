@@ -1002,6 +1002,10 @@ platform:
     provider_error_line: "⚠️ {label}: {error}"
     transformed_notice: "\n\n[스트리밍 후 응답이 변환됨]\n"
   discord:
+    start:
+        description: "Toggle free-response channel for this server"
+        followup: "🤖 AI Auto-Reply toggled for {channel}! Hermes will now respond to every message here without a ping."
+
     approval:
       question: "Hermes가 이 명령을 실행해도 될까요?"
       requested_command_label: "요청된 명령:"

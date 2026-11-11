@@ -1002,6 +1002,10 @@ platform:
     provider_error_line: "⚠️ {label}: {error}"
     transformed_notice: "\n\n[ストリーミング後に応答を変換しました]\n"
   discord:
+    start:
+        description: "Toggle free-response channel for this server"
+        followup: "🤖 AI Auto-Reply toggled for {channel}! Hermes will now respond to every message here without a ping."
+
     approval:
       question: "Hermes にこのコマンドを実行させますか？"
       requested_command_label: "要求されたコマンド:"

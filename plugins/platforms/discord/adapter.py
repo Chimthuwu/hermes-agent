@@ -120,6 +120,7 @@ _NATIVE_SLASH_COMMAND_SPECS: tuple = (
     ("undo", "platform.discord.command.undo.description", (), "/undo", None),
     ("status", "platform.discord.command.status.description", (), "/status", "platform.discord.command.status.followup"),
     ("sethome", "slash.sethome.description", (), "/sethome", None),
+    ("start", "platform.discord.start.description", (), "/start", "platform.discord.start.followup"),
     ("stop", "platform.discord.command.stop.description", (), "/stop", "platform.discord.command.stop.followup"),
     ("steer", "platform.discord.command.steer.description",
      (("prompt", str, _REQUIRED, "platform.discord.command.steer.arg_prompt", None),),
@@ -4481,7 +4482,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         try:
             if followup_msg:
                 # Native commands pass a catalog key; plugin callers may still pass literal text.
-                await interaction.edit_original_response(content=t(followup_msg))
+                _chan_id = getattr(interaction.channel, "id", None)
+                await interaction.edit_original_response(
+                    content=t(followup_msg, channel=f"<#{_chan_id}>" if _chan_id else "this channel")
+                )
             else:
                 await interaction.delete_original_response()
         except Exception as e:

@@ -495,6 +495,54 @@ class GatewaySlashCommandsMixin(
             logger.debug("Failed to clear typing on /stop with no active agent", exc_info=True)
         return t("gateway.stop.no_active")
 
+
+    async def _handle_start_command(self, event: MessageEvent) -> str:
+        """Handle /start - toggle free-response mode for the current channel.
+
+        When enabled, Hermes replies to every message in this channel without
+        requiring a mention or ping. The channel is added to / removed from
+        free_response_channels in the platform config (a comma-separated list
+        of channel IDs), persisted durably so the change survives a restart.
+        """
+        from gateway.run import _load_gateway_config
+        config_path, platform_key = self._display_config_target(event)
+        channel_id = getattr(event.source, "chat_id", None) or getattr(event, "chat_id", None)
+        if not channel_id:
+            return "Could not determine the channel for this command."
+        channel_id = str(channel_id).strip()
+        user_config = _load_gateway_config()
+        # Read current free-response channels (comma-separated string of IDs).
+        platforms = user_config.get("platforms", {}) if isinstance(user_config, dict) else {}
+        plat = platforms.get(platform_key, {}) if isinstance(platforms, dict) else {}
+        raw = plat.get("free_response_channels", "")
+        if isinstance(raw, (list, tuple)):
+            current = {str(c).strip() for c in raw if str(c).strip()}
+        else:
+            current = {c.strip() for c in str(raw).split(",") if c.strip()}
+        if channel_id in current:
+            current.discard(channel_id)
+            enabled = False
+        else:
+            current.add(channel_id)
+            enabled = True
+        new_value = ",".join(sorted(current, key=lambda x: int(x) if x.isdigit() else x))
+        try:
+            _write_raw_config_leaf(
+                config_path,
+                ("platforms", platform_key, "free_response_channels"),
+                new_value,
+            )
+        except Exception as e:  # pragma: no cover - defensive: never block the toggle on a write error
+            logger.warning("Failed to persist free_response_channels for /start: %s", e)
+            return f"Toggled in memory but could not save: {e}"
+        status = "ENABLED" if enabled else "DISABLED"
+        emoji = "ON" if enabled else "OFF"
+        return (
+            f"Free-response {status} ({emoji}) for <#{channel_id}>!\n"
+            f"Hermes will {'now reply to every message here without a ping' if enabled else 'no longer auto-reply here'}."
+        )
+
+
     async def _handle_platform_command(self, event: MessageEvent) -> str:
         """Handle ``/platform list|pause|resume [name]`` — inspect and manually control failed/paused
         adapters (pause stops the reconnect watcher; resume re-queues for retry)."""

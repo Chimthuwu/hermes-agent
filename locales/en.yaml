@@ -1047,6 +1047,10 @@ platform:
     provider_error_line: "⚠️ {label}: {error}"
     transformed_notice: "\n\n[Response transformed after streaming]\n"
   discord:
+    start:
+        description: "Toggle free-response channel for this server"
+        followup: "🤖 AI Auto-Reply toggled for {channel}! Hermes will now respond to every message here without a ping."
+
     # Exec-approval card / slash-confirm card. Button labels ≤ 80 chars; embed titles ≤ 256.
     approval:
       question: "Do you want Hermes to run this command?"

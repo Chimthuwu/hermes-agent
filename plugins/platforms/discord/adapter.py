@@ -6664,6 +6664,7 @@ def _voice_panel_channel_value(state: dict) -> str:
 
 def _voice_panel_embed(mode: str, state: dict, status: str):
     embed = discord.Embed(title="\U0001f399\ufe0f /voice \u2014 voice panel", color=_VOICE_PANEL_COLOR)
+    embed.set_thumbnail(url="https://github.com/Chimthuwu/Shut-Up-Hermes/raw/main/embeds_thumbnail.png")
     embed.add_field(name="Voice mode", value=_VOICE_PANEL_MODE_LABELS.get(mode, str(mode)), inline=True)
     embed.add_field(
         name="Voice channel", inline=True,
@@ -6974,10 +6975,12 @@ def _define_discord_view_classes() -> None:
                 return None
 
         def _config_embed(self, description: str, *, title: Optional[str] = None, color=None):
-            title = title if title is not None else t("platform.discord.picker.title")
-            return discord.Embed(
-                title=_truncate_discord_component_text(title, _DISCORD_EMBED_TITLE_LIMIT), description=description,
-                color=discord.Color.blue() if color is None else color)
+                    title = title if title is not None else t("platform.discord.picker.title")
+                    embed = discord.Embed(
+                        title=_truncate_discord_component_text(title, _DISCORD_EMBED_TITLE_LIMIT), description=description,
+                        color=discord.Color.blue() if color is None else color)
+                    embed.set_thumbnail(url="https://github.com/Chimthuwu/Shut-Up-Hermes/raw/main/embeds_thumbnail.png")
+                    return embed
 
         async def _on_provider_selected(self, interaction: discord.Interaction):
             if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):

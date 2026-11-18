@@ -33,6 +33,7 @@ from urllib.parse import quote, urljoin
 from agent.async_utils import (consume_detached_task_result as _consume_background_task_result)
 from agent.display import ToolPreview
 from agent.i18n import get_language, t
+from .discord_command_manifest import build_native_command_manifest, get_command_by_name
 from agent.retry_utils import parse_retry_after_seconds
 
 logger = logging.getLogger(__name__)
@@ -150,6 +151,14 @@ _NATIVE_SLASH_COMMAND_SPECS: tuple = (
         ("platform.discord.command.voice.choice_tts", "tts"), ("platform.discord.command.voice.choice_mode_off", "off"),
         ("platform.discord.command.voice.choice_status", "status"))),),
      "/voice {mode}", None),
+    # /vc: short alias for /voice. The proxy forwards /voice text, so both commands share one handler.
+    ("vc", "platform.discord.command.voice.description",
+     (("mode", str, "", "platform.discord.command.voice.arg_mode",
+       (("platform.discord.command.voice.choice_join", "join"), ("platform.discord.command.voice.choice_channel", "channel"),
+        ("platform.discord.command.voice.choice_leave", "leave"), ("platform.discord.command.voice.choice_mode_on", "on"),
+        ("platform.discord.command.voice.choice_tts", "tts"), ("platform.discord.command.voice.choice_mode_off", "off"),
+        ("platform.discord.command.voice.choice_status", "status"))),),
+     "/voice {mode}", None),
     ("update", "slash.update.description", (), "/update", "platform.discord.command.update.followup"),
     ("restart", "platform.discord.command.restart.description", (), "/restart", "platform.discord.command.restart.followup"),
     ("approve", "slash.approve.description",
@@ -186,23 +195,47 @@ def _t_discord(key: str, limit: int, **kwargs: Any) -> str:
 
 
 def _native_slash_commands() -> tuple:
-    """``_NATIVE_SLASH_COMMAND_SPECS`` with descriptions, parameter descriptions and Choice names
-    resolved for the active language: ``(name, description, args, template, followup_key)``.
-    Follow-ups stay KEYS — ``_run_simple_slash`` resolves them when the command actually runs."""
-    def _text(key: str) -> str:
-        return _t_discord(key, _DISCORD_APP_COMMAND_TEXT_LIMIT)
+    """Build native slash commands from the stable manifest.
 
-    def _choice_label(label: str) -> str:
-        return _text(label) if "." in label else label
-
+    Uses stable English descriptions from the manifest for command identity (fingerprint),
+    but keeps followup keys for runtime resolution via i18n when the command executes.
+    Returns: ``(name, description, args, template, followup_key)`` tuples.
+    """
     out = []
-    for name, description_key, args, template, followup_key in _NATIVE_SLASH_COMMAND_SPECS:
-        localized_args = tuple(
-            (arg_name, arg_type, default, _text(desc_key),
-             tuple((_choice_label(lbl), val) for lbl, val in choices) if choices else None)
-            for arg_name, arg_type, default, desc_key, choices in args)
-        out.append((name, _text(description_key), localized_args, template, followup_key))
+    for cmd in build_native_command_manifest():
+        name = cmd["name"]
+        # Use stable manifest description for command identity (fingerprint stability)
+        description = cmd["description"]
+        template = cmd.get("template")
+        followup_key = cmd.get("followup_key")
+
+        # Build args from manifest options (already stable English)
+        args = []
+        for opt in cmd.get("options", []):
+            arg_name = opt["name"]
+            arg_type = str  # Default to string
+            default = "" if not opt.get("required") else _REQUIRED
+            # Use the stable English description from manifest
+            desc_key = opt["description"]
+            choices = None
+            if "choices" in opt:
+                choices = tuple((c["name"], c["value"]) for c in opt["choices"])
+            args.append((arg_name, arg_type, default, desc_key, choices))
+
+        # Apply Discord text limit to description and args (already in English, but cap for safety)
+        capped_description = _truncate_discord_component_text(description, _DISCORD_APP_COMMAND_TEXT_LIMIT)
+        capped_args = tuple(
+            (arg_name, arg_type, default, _truncate_discord_component_text(desc_key, _DISCORD_APP_COMMAND_TEXT_LIMIT), choices)
+            for arg_name, arg_type, default, desc_key, choices in args
+        )
+
+        out.append((name, capped_description, capped_args, template, followup_key))
     return tuple(out)
+
+
+# Backward compatibility: tests import _NATIVE_SLASH_COMMAND_SPECS from this module.
+# Delegate to the manifest's legacy compatibility layer.
+from .discord_command_manifest import _NATIVE_SLASH_COMMAND_SPECS
 
 
 _DISCORD_SELECT_FIELD_LIMIT = 100
@@ -214,8 +247,9 @@ _DISCORD_SELECT_MAX_ROWS = 5
 # Model-select capacity: keep 2 rows for Back/Cancel, fill the rest with selects.
 _DISCORD_MODEL_SELECT_CAPACITY = (_DISCORD_SELECT_MAX_ROWS - 2) * _DISCORD_SELECT_MAX_OPTIONS
 _DISCORD_BUTTON_LABEL_LIMIT = 80
-# Embed titles cap at 256 chars.
+# Embed titles cap at 256 chars; field values cap at 1024.
 _DISCORD_EMBED_TITLE_LIMIT = 256
+_DISCORD_EMBED_FIELD_VALUE_LIMIT = 1024
 _DISCORD_ELLIPSIS = "\u2026"
 _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
     "non_conversational", "non_conversational_history",
@@ -1230,6 +1264,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self._voice_timeout_seconds = self._load_voice_timeout()
         self._playback_timeout_seconds = self._load_playback_timeout()
         self._voice_receivers: dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
+        # Live /voice panels: guild_id -> {message_id: VoicePanelView}, repainted on voice events.
+        self._voice_panels: dict[int, dict[int, Any]] = {}
+        self._voice_panel_refresh: dict[int, asyncio.Task] = {}  # guild_id -> pending repaint
         self._voice_listen_tasks: dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
@@ -1515,13 +1552,14 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
-                bot_guild_ids = set(adapter_self._voice_clients.keys())
-                if not bot_guild_ids:
-                    return
                 guild_id = member.guild.id
-                if guild_id not in bot_guild_ids:
+                # Also keep handling guilds where only a /voice panel is open: the panel's own
+                # connection can drop before the event lands, but the panel still needs repainting.
+                if guild_id not in adapter_self._voice_clients and not adapter_self._voice_panels.get(guild_id):
                     return
                 if member == adapter_self._client.user:
+                    # The bot joining/leaving changes the panel's Voice channel field.
+                    adapter_self.schedule_voice_panel_refresh(guild_id)
                     return
                 joined = before.channel is None and after.channel is not None
                 left = before.channel is not None and after.channel is None
@@ -1545,13 +1583,22 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     # state so it never decodes against a stale session.
                     vc = adapter_self._voice_clients.get(guild_id)
                     receiver = adapter_self._voice_receivers.get(guild_id)
-                    if vc is not None and receiver is not None:
-                        bot_channel = getattr(vc, "channel", None)
-                        if bot_channel is not None and (
-                            before.channel == bot_channel
-                            or after.channel == bot_channel
-                        ):
-                            receiver.refresh_credentials("membership change")
+                    bot_channel = getattr(vc, "channel", None) if vc is not None else None
+                    in_bot_channel = bot_channel is not None and (
+                        before.channel == bot_channel
+                        or after.channel == bot_channel
+                    )
+                    if in_bot_channel and receiver is not None:
+                        receiver.refresh_credentials("membership change")
+                    if in_bot_channel:
+                        # Repaint open panels: participant list and member count changed.
+                        if joined:
+                            notice = f"{member.display_name} joined **#{after.channel.name}**."
+                        elif left:
+                            notice = f"{member.display_name} left **#{before.channel.name}**."
+                        else:
+                            notice = f"{member.display_name} moved to **#{after.channel.name}**."
+                        adapter_self.schedule_voice_panel_refresh(guild_id, notice)
 
             # Register slash commands
             if self._slash_commands:
@@ -3899,6 +3946,29 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             return None
         return member.voice.channel
 
+    def stop_voice_playback(self, guild_id: int) -> bool:
+        """Stop any active voice playback in the guild (both mixer and legacy paths)."""
+        vc = self._voice_clients.get(guild_id)
+        if not vc or not vc.is_connected():
+            return False
+        stopped = False
+        # Mixer path
+        mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
+        if mixer is not None:
+            mixer.stop_speech()
+            stopped = True
+        # Legacy path
+        if vc.is_playing():
+            vc.stop()
+            stopped = True
+        return stopped
+
+    def connected_voice_channel_id(self, guild_id: int) -> Optional[int]:
+        """ID of the voice channel the bot is currently connected to, or None."""
+        vc = self._voice_clients.get(guild_id)
+        channel = getattr(vc, "channel", None) if vc and vc.is_connected() else None
+        return getattr(channel, "id", None)
+
     def _cancel_voice_timeout(self, guild_id: int) -> None:
         task = self._voice_timeout_tasks.pop(guild_id, None)
         if task:
@@ -3953,6 +4023,224 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         """Check if the bot is connected to a voice channel in this guild."""
         vc = self._voice_clients.get(guild_id)
         return vc is not None and vc.is_connected()
+
+    # --- /voice panel ---
+
+    def get_voice_channel_info(self, guild_id: int) -> Optional[Dict[str, Any]]:
+        """Voice channel info (name, members, count, who is speaking) or None when not connected."""
+        vc = self._voice_clients.get(guild_id)
+        if not vc or not vc.is_connected():
+            return None
+        channel = vc.channel
+        if not channel:
+            return None
+        members_info = []
+        bot_user = self._client.user if self._client else None
+        for member in channel.members:
+            if bot_user and member.id == bot_user.id:
+                continue  # the bot itself is not a participant
+            members_info.append({"user_id": member.id, "display_name": member.display_name, "is_bot": member.bot})
+        speaking_user_ids: set = set()
+        receiver = self._voice_receivers.get(guild_id)
+        if receiver:
+            now = time.monotonic()
+            with receiver._lock:
+                for ssrc, last_t in receiver._last_packet_time.items():
+                    if now - last_t < 2.0:
+                        uid = receiver._ssrc_to_user.get(ssrc)
+                        if uid:
+                            speaking_user_ids.add(uid)
+        for info in members_info:
+            info["is_speaking"] = info["user_id"] in speaking_user_ids
+        return {
+            "channel_name": channel.name, "member_count": len(members_info),
+            "members": members_info, "speaking_count": len(speaking_user_ids),
+        }
+
+    def _voice_panel_state(self, guild_id: Optional[int] = None) -> Dict[str, Any]:
+        """Snapshot the ``/voice`` panel renders: connection, participants, auto-leave timeout."""
+        if guild_id is None:
+            guild_id = next(iter(self._voice_clients), None)
+        info = self.get_voice_channel_info(guild_id) if guild_id is not None else None
+        return {
+            "in_channel": bool(info),
+            "channel_name": (info or {}).get("channel_name", ""),
+            "member_count": (info or {}).get("member_count", 0),
+            "members": (info or {}).get("members", []),
+            "auto_leave_seconds": self.voice_auto_leave_seconds(),
+        }
+
+    def voice_auto_leave_seconds(self) -> int:
+        """Current voice-channel inactivity timeout in seconds (0 = never auto-leave)."""
+        return self._voice_timeout_limit()
+
+    def cycle_voice_auto_leave_seconds(self) -> int:
+        """Advance to the next auto-leave option (off \u2192 5m \u2192 15m \u2192 1h \u2192 off).
+
+        An unlisted value already in the config moves to the nearest larger option rather than
+        jumping back to off, so a hand-edited timeout still cycles sensibly.
+        """
+        choices = VOICE_AUTO_LEAVE_CHOICES
+        current = self.voice_auto_leave_seconds()
+        following = next((choice for choice in choices if choice > current), choices[0])
+        return self.set_voice_auto_leave_seconds(following)
+
+    def set_voice_auto_leave_seconds(self, seconds: int) -> int:
+        """Apply + persist the inactivity timeout and re-arm any live timers immediately."""
+        try:
+            seconds = max(0, int(seconds))
+        except (TypeError, ValueError):
+            seconds = 0
+        self._voice_timeout_seconds = seconds
+        for guild_id in list(self._voice_clients):
+            if seconds > 0:
+                self._reset_voice_timeout(guild_id)
+            else:
+                self._cancel_voice_timeout(guild_id)
+        try:
+            from hermes_cli.config import read_raw_config, save_config
+            cfg = read_raw_config() or {}
+            section = cfg.get("discord")
+            if not isinstance(section, dict):
+                section = cfg["discord"] = {}
+            section["voice_channel_inactivity_timeout_seconds"] = seconds
+            save_config(cfg)
+        except Exception as e:
+            logger.warning("Could not persist voice inactivity timeout: %s", e)
+        return seconds
+
+    async def send_voice_panel(
+        self, chat_id: str, mode: str, on_action, metadata: Optional[Dict[str, Any]] = None,
+        notice: str = "",
+    ) -> "SendResult":
+        """Send the ``/voice`` button panel.
+
+        ``on_action(chat_id, value)`` runs a click and returns the refreshed card as
+        ``{"status": str, "mode": str, "state": {...}}``; ``value`` is a reply mode
+        (``voice_only``/``all``/``off``), ``join``/``leave``, or ``auto_leave``.
+        ``notice`` is an extra leading status line (e.g. the auto-join result).
+        """
+        supports_channels = hasattr(self, "join_voice_channel")
+        state = self._voice_panel_state()
+        status = "Voice mode disabled." if mode == "off" else "Voice mode enabled."
+        if notice:
+            status = f"{notice}\n{status}"
+
+        sent: Dict[str, Any] = {}
+
+        def _build(_channel):
+            embed = _voice_panel_embed(mode, state, status)
+            view = VoicePanelView(
+                on_action=on_action, mode=mode, state=state, supports_channels=supports_channels,
+                allowed_user_ids=self._allowed_user_ids, allowed_role_ids=self._allowed_role_ids,
+            )
+            view.status = status
+            # Kept so voice join/leave events can repaint this exact message later.
+            view.guild_id = getattr(getattr(_channel, "guild", None), "id", None)
+            sent["view"] = view
+            return {"content": _voice_panel_content(mode, state, status), "embed": embed, "view": view}, view
+        result = await self._send_prompt(chat_id, metadata, _build, fail_log="send_voice_panel")
+        if getattr(result, "success", False):
+            self._register_voice_panel(sent.get("view"))
+            # Also send to the voice channel (VC chat sidebar) if connected
+            try:
+                view = sent.get("view")
+                guild_id = getattr(view, "guild_id", None)
+                if guild_id:
+                    vc = self._voice_clients.get(guild_id)
+                    if vc and vc.is_connected() and vc.channel:
+                        # Build a fresh view for the VC (can't reuse the same view instance)
+                        vc_embed = _voice_panel_embed(mode, state, status)
+                        vc_view = VoicePanelView(
+                            on_action=on_action, mode=mode, state=state, supports_channels=supports_channels,
+                            allowed_user_ids=self._allowed_user_ids, allowed_role_ids=self._allowed_role_ids,
+                        )
+                        vc_view.status = status
+                        vc_view.guild_id = guild_id
+                        await vc.channel.send(
+                            content=_voice_panel_content(mode, state, status),
+                            embed=vc_embed,
+                            view=vc_view
+                        )
+            except Exception:
+                logger.debug("Voice panel send to voice channel failed", exc_info=True)
+        return result
+
+    # --- /voice panel live refresh ---
+
+    def _register_voice_panel(self, view: Any) -> None:
+        """Track a sent panel so later voice events can edit it instead of posting again."""
+        message = getattr(view, "_message", None)
+        guild_id = getattr(view, "guild_id", None)
+        if message is None or guild_id is None:
+            return
+        panels = self._voice_panels.setdefault(guild_id, {})
+        # One live panel per text channel: a re-run /voice supersedes the previous one there, so
+        # stale copies are dropped from tracking instead of all being edited on every voice event.
+        channel = getattr(message, "channel", None)
+        if channel is not None:
+            for message_id, older in list(panels.items()):
+                older_channel = getattr(getattr(older, "_message", None), "channel", None)
+                if message_id != message.id and older_channel is not None and older_channel.id == channel.id:
+                    panels.pop(message_id, None)
+        panels[message.id] = view
+
+    def schedule_voice_panel_refresh(self, guild_id: int, notice: str = "") -> None:
+        """Queue a coalesced panel repaint after a voice-membership change.
+
+        Chats routinely see several people join at once and Discord rate-limits message edits
+        per channel, so one debounced repaint per guild replaces a burst of edits.
+        """
+        if not self._voice_panels.get(guild_id):
+            return
+        pending = self._voice_panel_refresh.pop(guild_id, None)
+        if pending is not None and not pending.done():
+            pending.cancel()
+
+        async def _run() -> None:
+            try:
+                await asyncio.sleep(_VOICE_PANEL_REFRESH_DELAY)
+                await self._refresh_voice_panels(guild_id, notice)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("voice panel: refresh failed", exc_info=True)
+            finally:
+                if self._voice_panel_refresh.get(guild_id) is asyncio.current_task():
+                    self._voice_panel_refresh.pop(guild_id, None)
+
+        try:
+            self._voice_panel_refresh[guild_id] = asyncio.create_task(_run())
+        except RuntimeError:  # no running loop (shutdown in progress)
+            logger.debug("voice panel: no event loop for refresh")
+
+    async def _refresh_voice_panels(self, guild_id: int, notice: str = "") -> None:
+        """Repaint every open panel of ``guild_id`` with the current connection state."""
+        panels = self._voice_panels.get(guild_id) or {}
+        if not panels:
+            return
+        state = self._voice_panel_state(guild_id)
+        for message_id, view in list(panels.items()):
+            message = getattr(view, "_message", None)
+            if message is None:
+                panels.pop(message_id, None)
+                continue
+            view.state = dict(state)
+            if notice:
+                view.status = notice
+            status = getattr(view, "status", "") or (
+                "Voice mode disabled." if view.mode == "off" else "Voice mode enabled.")
+            try:
+                view._build()  # Join/Leave label and auto-leave label come from the new state
+                await message.edit(
+                    content=_voice_panel_content(view.mode, dict(state), status),
+                    embed=_voice_panel_embed(view.mode, dict(state), status), view=view)
+            except discord.NotFound:
+                panels.pop(message_id, None)  # panel message was deleted
+            except Exception as e:
+                logger.debug("voice panel: edit failed for message %s: %s", message_id, e)
+        if not panels:
+            self._voice_panels.pop(guild_id, None)
 
     # --- Voice listening (Phase 2) ---
 
@@ -6315,10 +6603,100 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
 # ---------------------------------------------------------------------------
 
 
+# --- /voice panel ---------------------------------------------------------------
+# Wording is fixed English (matching the original panel) rather than localized: the panel is a
+# personal-install surface and every string here is shown verbatim in the user's request.
+_VOICE_PANEL_COLOR = 0x5865F2  # Discord blurple
+_VOICE_PANEL_FOOTER = "Buttons apply instantly \u2014 no restart needed."
+_VOICE_PANEL_MODE_LABELS = {
+    "off": "Off (text only)",
+    "voice_only": "On \u2014 voice replies only",
+    "all": "On \u2014 text + TTS",
+}
+
+
+# Auto-leave button cycles through these inactivity timeouts, in order (0 = never leaves).
+VOICE_AUTO_LEAVE_CHOICES = (0, 300, 900, 3600)
+
+# Debounce for live panel repaints: join/leave bursts arrive together and edits are rate-limited.
+_VOICE_PANEL_REFRESH_DELAY = 0.6
+
+
+def _voice_auto_leave_short(seconds: Any) -> str:
+    """Compact duration for the button label: ``off`` / ``5m`` / ``15m`` / ``1h``."""
+    try:
+        value = int(seconds or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        return "off"
+    if value % 3600 == 0:
+        return f"{value // 3600}h"
+    if value % 60 == 0:
+        return f"{value // 60}m"
+    return f"{value}s"
+
+
+def _voice_panel_auto_leave_label(seconds: Any) -> str:
+    try:
+        value = int(seconds or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        return "Off (never leaves)"
+    if value % 3600 == 0:
+        return f"{value // 3600} h idle"
+    if value % 60 == 0:
+        return f"{value // 60} min idle"
+    return f"{value}s idle"
+
+
+def _voice_panel_channel_value(state: dict) -> str:
+    """``**#channel** \u2014 N participant(s)`` plus the member list, or a not-connected line."""
+    if not state.get("in_channel"):
+        return "Not connected"
+    lines = [f"**#{state.get('channel_name') or 'voice'}** \u2014 {int(state.get('member_count') or 0)} participant(s)"]
+    for member in list(state.get("members") or [])[:8]:
+        speaking = " (speaking)" if member.get("is_speaking") else ""
+        lines.append(f"  - {member.get('display_name') or member.get('user_id')}{speaking}")
+    return "\n".join(lines)
+
+
+def _voice_panel_embed(mode: str, state: dict, status: str):
+    embed = discord.Embed(title="\U0001f399\ufe0f /voice \u2014 voice panel", color=_VOICE_PANEL_COLOR)
+    embed.add_field(name="Voice mode", value=_VOICE_PANEL_MODE_LABELS.get(mode, str(mode)), inline=True)
+    embed.add_field(
+        name="Voice channel", inline=True,
+        value=_truncate_discord_component_text(_voice_panel_channel_value(state), _DISCORD_EMBED_FIELD_VALUE_LIMIT),
+    )
+    embed.add_field(name="Auto-leave timeout",
+                    value=_voice_panel_auto_leave_label(state.get("auto_leave_seconds")), inline=True)
+    embed.add_field(
+        name="Status", inline=False,
+        value=_truncate_discord_component_text(status or "\u2014", _DISCORD_EMBED_FIELD_VALUE_LIMIT),
+    )
+    embed.set_footer(text=_VOICE_PANEL_FOOTER)
+    return embed
+
+
+def _voice_panel_content(mode: str, state: dict, status: str) -> str:
+    """Plain-text mirror of the panel: embeds can arrive detached on web/mobile clients."""
+    status = status or "\u2014"
+    return "\n".join([
+        "**\U0001f399\ufe0f /voice \u2014 voice panel**",
+        "",
+        f"**Voice mode:** {_VOICE_PANEL_MODE_LABELS.get(mode, str(mode))}",
+        f"**Voice channel:** {_voice_panel_channel_value(state)}",
+        f"**Auto-leave timeout:** {_voice_panel_auto_leave_label(state.get('auto_leave_seconds'))}",
+        f"**Status:** {status}",
+        f"*{_VOICE_PANEL_FOOTER}*",
+    ])
+
+
 def _define_discord_view_classes() -> None:
     """Register Discord UI view classes as module globals.
     Called at module load and after a lazy install so the classes exist whenever DISCORD_AVAILABLE."""
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView, VoicePanelView
 
     class _HermesView(discord.ui.View):
         """Shared plumbing for Hermes component views: allowlist auth, single-use
@@ -6743,6 +7121,95 @@ def _define_discord_view_classes() -> None:
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
+
+    class VoicePanelView(_HermesView):
+        """Persistent ``/voice`` panel: reply-mode buttons, Join/Leave, auto-leave toggle, and Shut up."""
+
+        # (reply mode, button label, style)
+        _MODE_BUTTONS = (
+            ("voice_only", "Voice only", discord.ButtonStyle.green),
+            ("all", "Text + TTS", discord.ButtonStyle.blurple),
+            ("off", "Off", discord.ButtonStyle.grey),
+        )
+
+        def __init__(self, on_action, mode: str, state: dict, supports_channels: bool,
+                     allowed_user_ids: set, allowed_role_ids: Optional[set] = None):
+            super().__init__(allowed_user_ids, allowed_role_ids, timeout=None)
+            self.on_action = on_action
+            self.mode = mode or "off"
+            self.state = dict(state or {})
+            self.status = ""
+            self.supports_channels = bool(supports_channels)
+            self._build()
+
+        def _build(self) -> None:
+            """(Re)build the buttons from ``self.mode``/``self.state``."""
+            self.clear_items()
+            for value, label, style in self._MODE_BUTTONS:
+                button = discord.ui.Button(label=label, style=style, custom_id=f"voice_mode_{value}",
+                                           disabled=(self.mode == value))
+                button.callback = self._on_mode
+                self.add_item(button)
+            if not self.supports_channels:
+                return
+            joined = bool(self.state.get("in_channel"))
+            channel_btn = discord.ui.Button(
+                label="Leave" if joined else "Join",
+                style=discord.ButtonStyle.danger if joined else discord.ButtonStyle.secondary,
+                custom_id="voice_channel_toggle")
+            channel_btn.callback = self._on_channel
+            self.add_item(channel_btn)
+            auto_btn = discord.ui.Button(
+                label=f"Auto-leave: {_voice_auto_leave_short(self.state.get('auto_leave_seconds'))}",
+                style=discord.ButtonStyle.secondary, custom_id="voice_auto_leave")
+            auto_btn.callback = self._on_auto_leave
+            self.add_item(auto_btn)
+            # Shut up button - stops TTS/voice playback immediately
+            shutup_btn = discord.ui.Button(
+                label="Shut up", style=discord.ButtonStyle.danger,
+                custom_id="voice_shut_up", emoji="🔇")
+            shutup_btn.callback = self._on_shut_up
+            self.add_item(shutup_btn)
+
+        async def _apply(self, interaction: discord.Interaction, value: str) -> None:
+            """Run one panel action and repaint the card with the returned state/status."""
+            if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):
+                return
+            await interaction.response.defer()
+            try:
+                result = await self.on_action(str(interaction.channel_id), value)
+            except Exception as exc:
+                logger.error("Voice panel action %s failed: %s", value, exc)
+                result = {"status": t("platform.discord.picker.choice_error", error=str(exc))}
+            if isinstance(result, dict):
+                self.mode = str(result.get("mode") or self.mode)
+                if isinstance(result.get("state"), dict):
+                    self.state = result["state"]
+                self.status = str(result.get("status") or self.status)
+            else:
+                self.status = str(result or self.status)
+            self._build()
+            try:
+                await interaction.edit_original_response(
+                    content=_voice_panel_content(self.mode, self.state, self.status),
+                    embed=_voice_panel_embed(self.mode, self.state, self.status), view=self)
+            except Exception as exc:
+                logger.warning("Voice panel refresh failed: %s", exc)
+
+        async def _on_mode(self, interaction: discord.Interaction):
+            custom_id = str(interaction.data.get("custom_id", ""))
+            await self._apply(interaction, custom_id[len("voice_mode_"):] if custom_id.startswith("voice_mode_") else "off")
+
+        async def _on_channel(self, interaction: discord.Interaction):
+            await self._apply(interaction, "leave" if self.state.get("in_channel") else "join")
+
+        async def _on_auto_leave(self, interaction: discord.Interaction):
+            await self._apply(interaction, "auto_leave")
+
+        async def _on_shut_up(self, interaction: discord.Interaction):
+            await self._apply(interaction, "shut_up")
+
+        # No on_timeout: this view must not expire.
 
     class ClarifyChoiceView(_HermesView):
         """One button per clarify choice (max 24) plus ``✏️ Other``. A numeric click resolves the

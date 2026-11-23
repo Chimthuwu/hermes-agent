@@ -249,6 +249,12 @@ def build_native_command_manifest() -> List[Dict[str, Any]]:
             "Re-scan skills for new or removed entries",
             template="/reload-skills",
         ),
+        # /sesh: direct entry point for the sesh AFK worker skill
+        _cmd(
+            "sesh",
+            "Run the sesh AFK worker across selected projects",
+            template="/sesh",
+        ),
         _cmd(
             "voice",
             "Toggle voice reply mode",

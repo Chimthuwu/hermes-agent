@@ -226,6 +226,11 @@
       "template": "/reload-skills"
     },
     {
+      "name": "sesh",
+      "description": "Run the sesh AFK worker across selected projects",
+      "template": "/sesh"
+    },
+    {
       "name": "voice",
       "description": "Toggle voice reply mode",
       "options": [

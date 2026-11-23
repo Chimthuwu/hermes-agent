@@ -520,14 +520,30 @@ class GatewaySlashCommandsMixin(
             return "Could not determine the channel for this command."
         channel_id = str(channel_id).strip()
         user_config = _load_gateway_config()
-        # Read current free-response channels (comma-separated string of IDs).
+        # The adapter resolves free-response channels from the effective ``<plat>:``
+        # section first (a top-level legacy block outranks ``platforms.<plat>``), and
+        # falls back to ``<PLAT>_FREE_RESPONSE_CHANNELS``. Writing only the nested
+        # key makes /start work in memory but silently revert on the next gateway
+        # restart, when the stale top-level block or env value wins. Fold every
+        # source into the union, then persist to all authoritative locations.
+        from hermes_cli.config import read_user_config_raw
         platforms = user_config.get("platforms", {}) if isinstance(user_config, dict) else {}
         plat = platforms.get(platform_key, {}) if isinstance(platforms, dict) else {}
-        raw = plat.get("free_response_channels", "")
-        if isinstance(raw, (list, tuple)):
-            current = {str(c).strip() for c in raw if str(c).strip()}
-        else:
-            current = {c.strip() for c in str(raw).split(",") if c.strip()}
+        raw_config = read_user_config_raw(config_path)
+        top_block = raw_config.get(platform_key) if isinstance(raw_config, dict) else None
+        top_has_key = isinstance(top_block, dict) and "free_response_channels" in top_block
+        sources = [plat.get("free_response_channels", "") if isinstance(plat, dict) else ""]
+        if top_has_key:
+            sources.append(top_block["free_response_channels"])
+        env_key = f"{platform_key.upper()}_FREE_RESPONSE_CHANNELS"
+        if os.environ.get(env_key):
+            sources.append(os.environ[env_key])
+        current: set[str] = set()
+        for raw in sources:
+            if isinstance(raw, (list, tuple)):
+                current.update(str(c).strip() for c in raw if str(c).strip())
+            elif raw is not None:
+                current.update(c.strip() for c in str(raw).split(",") if c.strip())
         if channel_id in current:
             current.discard(channel_id)
             enabled = False
@@ -541,6 +557,13 @@ class GatewaySlashCommandsMixin(
                 ("platforms", platform_key, "free_response_channels"),
                 new_value,
             )
+            if top_has_key:
+                # platform_section() prefers the top-level block at startup.
+                _write_raw_config_leaf(
+                    config_path,
+                    (platform_key, "free_response_channels"),
+                    new_value,
+                )
         except Exception as e:  # pragma: no cover - defensive: never block the toggle on a write error
             logger.warning("Failed to persist free_response_channels for /start: %s", e)
             return f"Toggled in memory but could not save: {e}"

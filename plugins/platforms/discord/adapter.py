@@ -6876,18 +6876,19 @@ def _define_discord_view_classes() -> None:
         editing the original message in place. Times out after 2 minutes."""
 
         def __init__(
-            self, providers: list, current_model: str, current_provider: str, session_key: str,
-            on_model_selected, allowed_user_ids: set, allowed_role_ids: Optional[set] = None,
-        ):
-            super().__init__(allowed_user_ids, allowed_role_ids, timeout=120)
-            self.providers = providers
-            self.current_model = current_model
-            self.current_provider = current_provider
-            self.session_key = session_key
-            self.on_model_selected = on_model_selected
-            self._selected_provider: str = ""
-            self._pending_expensive_model: str = ""
-            self._build_provider_select()
+                    self, providers: list, current_model: str, current_provider: str, session_key: str,
+                    on_model_selected, allowed_user_ids: set, allowed_role_ids: Optional[set] = None,
+                ):
+                    super().__init__(allowed_user_ids, allowed_role_ids, timeout=120)
+                    self.providers = providers
+                    self.current_model = current_model
+                    self.current_provider = current_provider
+                    self.session_key = session_key
+                    self.on_model_selected = on_model_selected
+                    self._selected_provider: str = ""
+                    self._pending_expensive_model: str = ""
+                    self._model_page: int = 0  # pagination page index (0-based)
+                    self._build_provider_select()
 
         def _add_button(self, label: str, style, custom_id: str, callback) -> None:
             btn = discord.ui.Button(label=label, style=style, custom_id=custom_id)
@@ -6925,39 +6926,73 @@ def _define_discord_view_classes() -> None:
             self._add_button(_t_discord("platform.discord.picker.cancel", _DISCORD_BUTTON_LABEL_LIMIT), discord.ButtonStyle.red, "model_cancel", self._on_cancel)
 
         def _build_model_select(self, provider_slug: str):
-            """Model dropdown(s) for one provider.
-            Select caps at 25 options and View at 5 rows (2 reserved for Back/Cancel), so models are
-            partitioned across up to 3 selects (75) rather than truncated (tail entries would vanish)."""
-            self.clear_items()
-            provider = next((p for p in self.providers if p["slug"] == provider_slug), None)
-            if not provider:
-                return
-            models = provider.get("models", [])
-            if not models:
-                return
-            chunks = [
-                models[i : i + _DISCORD_SELECT_MAX_OPTIONS]
-                for i in range(0, len(models), _DISCORD_SELECT_MAX_OPTIONS)
-            ][: _DISCORD_SELECT_MAX_ROWS - 2]
-            placeholder_base = t("platform.discord.picker.model_placeholder", provider=provider.get("name", provider_slug))
-            from hermes_cli.model_picker_usage import picker_row_suffix
-            for idx, chunk in enumerate(chunks):
-                options = [
-                    discord.SelectOption(
-                        label=_truncate_discord_component_text(model_id.split("/")[-1], _DISCORD_SELECT_FIELD_LIMIT),
-                        value=_truncate_discord_component_text(model_id, _DISCORD_SELECT_FIELD_LIMIT),
-                        # Usage-window plans: "Large" / "Free" (empty for every other account).
-                        description=(_truncate_discord_component_text(suffix, _DISCORD_SELECT_FIELD_LIMIT)
-                                     if (suffix := picker_row_suffix(provider, model_id)) else None),
-                    )
-                    for model_id in chunk
-                ]
-                suffix = f" ({idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
-                self._add_select(
-                    _truncate_discord_component_text(f"{placeholder_base}{suffix}...", _DISCORD_SELECT_PLACEHOLDER_LIMIT),
-                    options, f"model_model_select_{idx}", self._on_model_selected)
-            self._add_button(_t_discord("platform.discord.picker.back", _DISCORD_BUTTON_LABEL_LIMIT), discord.ButtonStyle.grey, "model_back", self._on_back)
-            self._add_button(_t_discord("platform.discord.picker.cancel", _DISCORD_BUTTON_LABEL_LIMIT), discord.ButtonStyle.red, "model_cancel2", self._on_cancel)
+                    """Model dropdown(s) for one provider.
+                    Select caps at 25 options and View at 5 rows (2 reserved for Back/Cancel), so models are
+                    partitioned across up to 3 selects (75 per page). Pagination (Next/Prev) cycles through all models.
+                    """
+                    self.clear_items()
+                    provider = next((p for p in self.providers if p["slug"] == provider_slug), None)
+                    if not provider:
+                        return
+                    models = provider.get("models", [])
+                    if not models:
+                        return
+
+                    # Pagination: 75 models per page (3 selects × 25 options)
+                    models_per_page = _DISCORD_MODEL_SELECT_CAPACITY
+                    total_pages = max(1, (len(models) + models_per_page - 1) // models_per_page)
+                    self._model_page = max(0, min(self._model_page, total_pages - 1))
+
+                    start = self._model_page * models_per_page
+                    end = min(start + models_per_page, len(models))
+                    page_models = models[start:end]
+
+                    # Partition into up to 3 selects (25 options each)
+                    chunks = [
+                        page_models[i : i + _DISCORD_SELECT_MAX_OPTIONS]
+                        for i in range(0, len(page_models), _DISCORD_SELECT_MAX_OPTIONS)
+                    ][: _DISCORD_SELECT_MAX_ROWS - 2]
+
+                    placeholder_base = t("platform.discord.picker.model_placeholder", provider=provider.get("name", provider_slug))
+                    from hermes_cli.model_picker_usage import picker_row_suffix
+                    for idx, chunk in enumerate(chunks):
+                        options = [
+                            discord.SelectOption(
+                                label=_truncate_discord_component_text(model_id.split("/")[-1], _DISCORD_SELECT_FIELD_LIMIT),
+                                value=_truncate_discord_component_text(model_id, _DISCORD_SELECT_FIELD_LIMIT),
+                                description=(_truncate_discord_component_text(suffix, _DISCORD_SELECT_FIELD_LIMIT)
+                                             if (suffix := picker_row_suffix(provider, model_id)) else None),
+                            )
+                            for model_id in chunk
+                        ]
+                        suffix = f" ({idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+                        if total_pages > 1:
+                            suffix += f" [Page {self._model_page + 1}/{total_pages}]"
+                        self._add_select(
+                            _truncate_discord_component_text(f"{placeholder_base}{suffix}...", _DISCORD_SELECT_PLACEHOLDER_LIMIT),
+                            options, f"model_model_select_{idx}", self._on_model_selected)
+
+                    # Navigation row: Prev / Page indicator / Next
+                    nav_buttons = []
+                    if self._model_page > 0:
+                        nav_buttons.append(("◀ Prev", "model_prev_page", self._on_prev_page))
+                    if total_pages > 1:
+                        nav_buttons.append((f"Page {self._model_page + 1}/{total_pages}", "model_page_indicator", None))
+                    if self._model_page < total_pages - 1:
+                        nav_buttons.append(("Next ▶", "model_next_page", self._on_next_page))
+
+                    for label, cid, cb in nav_buttons:
+                        if cb is None:
+                            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.grey, custom_id=cid, disabled=True)
+                            self.add_item(btn)
+                        else:
+                            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.blurple, custom_id=cid)
+                            btn.callback = cb
+                            self.add_item(btn)
+
+                    # Bottom row: Back / Cancel
+                    self._add_button(_t_discord("platform.discord.picker.back", _DISCORD_BUTTON_LABEL_LIMIT), discord.ButtonStyle.grey, "model_back", self._on_back)
+                    self._add_button(_t_discord("platform.discord.picker.cancel", _DISCORD_BUTTON_LABEL_LIMIT), discord.ButtonStyle.red, "model_cancel2", self._on_cancel)
 
         def _build_expensive_confirm(self, model_id: str):
             """Build confirmation buttons for unusually expensive models."""
@@ -6997,6 +7032,20 @@ def _define_discord_view_classes() -> None:
             # Window plans: the limit line leads the message (absent for every other account).
             plan_line = f"⚠️ {provider['plan_line']}\n" if provider and provider.get("plan_line") else ""
             await self._edit(interaction, plan_line + t("platform.discord.picker.select_model", provider=pname, extra=extra))
+
+        async def _on_prev_page(self, interaction: discord.Interaction):
+            if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):
+                return
+            self._model_page -= 1
+            self._build_model_select(self._selected_provider)
+            await self._edit(interaction, t("platform.discord.picker.select_model", provider=self._selected_provider))
+
+        async def _on_next_page(self, interaction: discord.Interaction):
+            if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):
+                return
+            self._model_page += 1
+            self._build_model_select(self._selected_provider)
+            await self._edit(interaction, t("platform.discord.picker.select_model", provider=self._selected_provider))
 
         async def _switch_selected_model(self, interaction: discord.Interaction, model_id: str):
             if not await self._gate(interaction, resolved_msg=t("platform.discord.picker.already_resolved"), unauth_msg=_unauthorized()):

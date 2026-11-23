@@ -53,6 +53,15 @@ _DIFF_MODE_BY_ARG = {**dict.fromkeys(("staged", "--staged", "cached", "--cached"
                      **dict.fromkeys(("all", "--all", "head"), "all"), "session": "session"}
 
 # /voice subcommand -> stored mode (None = auto-TTS disabled), confirmation i18n key.
+def _voice_timeout_duration(seconds: int) -> str:
+    """Readable auto-leave duration: ``5 min`` / ``15 min`` / ``1 h`` (falls back to seconds)."""
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600} h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60} min"
+    return f"{seconds}s"
+
+
 _VOICE_MODE_BY_ARG = {
     **dict.fromkeys(("on", "enable"), ("voice_only", "gateway.voice.enabled_voice_only")),
     **dict.fromkeys(("off", "disable"), ("off", "gateway.voice.disabled_text")),
@@ -535,6 +544,20 @@ class GatewaySlashCommandsMixin(
         except Exception as e:  # pragma: no cover - defensive: never block the toggle on a write error
             logger.warning("Failed to persist free_response_channels for /start: %s", e)
             return f"Toggled in memory but could not save: {e}"
+        # Keep the running gateway config in sync too. Adapters read free_response_channels from
+        # their PlatformConfig.extra at message time, so persisting only to config.yaml would leave
+        # the toggle inert until the next gateway restart (mirrors /sethome's in-memory update).
+        try:
+            from gateway.config import Platform, PlatformConfig
+            platform = getattr(event.source, "platform", None)
+            if not isinstance(platform, Platform):
+                platform = Platform(str(platform)) if platform else None
+            gateway_config = getattr(self, "config", None)
+            if gateway_config is not None and platform is not None:
+                platform_config = gateway_config.platforms.setdefault(platform, PlatformConfig())
+                platform_config.extra["free_response_channels"] = new_value
+        except Exception:
+            logger.debug("Failed to sync free_response_channels into the running config", exc_info=True)
         status = "ENABLED" if enabled else "DISABLED"
         emoji = "ON" if enabled else "OFF"
         return (
@@ -728,8 +751,128 @@ class GatewaySlashCommandsMixin(
         platform_config.home_channel = home
         return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)
 
-    async def _handle_voice_command(self, event: MessageEvent) -> str:
-        """Handle /voice [on|off|tts|channel|leave|status] command."""
+    async def _voice_panel_apply_mode(self, event: MessageEvent, mode: str) -> str:
+        """Persist ``mode`` for this chat and return the confirmation line. Shared by typed
+        ``/voice <arg>`` and the Discord panel's mode buttons so both route identically."""
+        self._apply_voice_mode(self._delivery_adapter_for(event.source),
+                               self._voice_key_for_source(event.source), event.source.chat_id, mode)
+        try:
+            from gateway.session_config import local_voice_transition
+            local_voice_transition(event.source, mode)
+        except Exception:
+            pass
+        reply_key = {"voice_only": "gateway.voice.enabled_voice_only",
+                     "all": "gateway.voice.tts_enabled",
+                     "off": "gateway.voice.disabled_text"}.get(mode)
+        return t(reply_key) if reply_key else t(f"gateway.voice.label_{mode}")
+
+    async def _voice_panel_apply_channel(self, event: MessageEvent, value: str) -> str:
+        """Join/leave the caller's voice channel from a panel click (``value`` = join|leave)."""
+        if value == "join":
+            return await self._handle_voice_channel_join(event)
+        if value == "leave":
+            return await self._handle_voice_channel_leave(event)
+        return t("gateway.voice.channel_unsupported")
+
+    async def _voice_panel_apply_auto_leave(self, event: MessageEvent) -> str:
+        """Cycle the voice-channel inactivity timeout: off \u2192 5 min \u2192 15 min \u2192 1 h \u2192 off."""
+        adapter = self._delivery_adapter_for(event.source)
+        cycler = getattr(adapter, "cycle_voice_auto_leave_seconds", None)
+        if not callable(cycler):
+            return t("gateway.voice.channel_unsupported")
+        seconds = int(cycler() or 0)
+        if seconds <= 0:
+            return "Auto-leave off \u2014 the bot stays in the channel until /voice leave."
+        return (f"Auto-leave set to {_voice_timeout_duration(seconds)} \u2014 the bot leaves after "
+                f"{_voice_timeout_duration(seconds)} of inactivity.")
+
+    async def _voice_panel_auto_join(self, event: MessageEvent) -> str:
+        """Join the caller's voice channel when ``/voice`` or ``/vc`` is run from inside one.
+
+        Returns the line to show on the panel's status line: the join confirmation, or the join
+        error when the attempt failed, or "" when there is nothing to do (caller not in a channel,
+        no voice support, already connected to that same channel). Never raises: the panel must
+        still open when joining is impossible.
+        """
+        adapter = self._delivery_adapter_for(event.source)
+        if adapter is None or not hasattr(adapter, "join_voice_channel"):
+            return ""
+        getter = getattr(adapter, "get_user_voice_channel", None)
+        if not callable(getter):
+            return ""
+        guild_id = self._get_guild_id(event)
+        if not guild_id:
+            return ""
+        try:
+            target = await getter(guild_id, event.source.user_id)
+        except Exception:
+            logger.debug("voice panel: could not resolve the caller's voice channel", exc_info=True)
+            return ""
+        if target is None:
+            return ""
+        connected = getattr(adapter, "connected_voice_channel_id", None)
+        if callable(connected) and connected(guild_id) == getattr(target, "id", None):
+            return ""  # already listening there; don't churn the connection
+        try:
+            text = await self._handle_voice_channel_join(event)
+        except Exception:
+            logger.warning("voice panel: auto-join failed", exc_info=True)
+            return ""
+        # On success keep only "Joined voice channel **x**." — the rest of the join message is
+        # instructions the panel's buttons already offer. Failures keep their full explanation.
+        if callable(connected) and connected(guild_id) == getattr(target, "id", None):
+            return text.split("\n", 1)[0]
+        return text
+
+    async def _try_send_voice_panel(self, event: MessageEvent, mode: str, notice: str = "") -> bool:
+        """Send the Discord ``/voice`` button panel when the adapter supports it; True when sent
+        (the adapter owns the reply, so the handler returns None). Any failure falls back to text."""
+        adapter = self._delivery_adapter_for(event.source)
+        if adapter is None or getattr(type(adapter), "send_voice_panel", None) is None:
+            return False
+        state_getter = getattr(adapter, "_voice_panel_state", None)
+
+        async def _on_action(_chat_id: str, value: str) -> dict:
+                            new_mode = self._voice_mode.get(self._voice_key_for_source(event.source), mode)
+                            if value in ("join", "leave"):
+                                text = await self._voice_panel_apply_channel(event, value)
+                                new_mode = self._voice_mode.get(self._voice_key_for_source(event.source), new_mode)
+                            elif value == "auto_leave":
+                                text = await self._voice_panel_apply_auto_leave(event)
+                            elif value in ("voice_only", "all", "off"):
+                                text = await self._voice_panel_apply_mode(event, value)
+                                new_mode = value
+                            elif value == "shut_up":
+                                guild_id = self._get_guild_id(event)
+                                if guild_id and adapter is not None:
+                                    try:
+                                        adapter.stop_voice_playback(guild_id)
+                                    except Exception:
+                                        pass
+                                # Also stop local TTS playback
+                                from tools.voice_mode import stop_playback
+                                stop_playback()
+                                text = "Playback stopped."
+                            else:
+                                text = t("gateway.voice.channel_unsupported")
+                            return {"status": text, "mode": new_mode,
+                                    "state": state_getter() if callable(state_getter) else {}}
+
+        try:
+            result = await adapter.send_voice_panel(
+                chat_id=event.source.chat_id, mode=mode, on_action=_on_action,
+                metadata=self._reply_metadata(event), notice=notice)
+            return bool(getattr(result, "success", False))
+        except Exception as e:
+            logger.warning("send_voice_panel failed, falling back to text: %s", e)
+            return False
+
+    async def _handle_voice_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /voice [on|off|tts|channel|leave|status] command.
+
+        Bare ``/voice`` and ``/voice status`` send the button panel on adapters that have one
+        (Discord); every other platform, and any panel failure, keeps the original text output.
+        """
         args = event.get_command_args().strip().lower()
         chat_id = event.source.chat_id
         # Voice state belongs to the (bot, chat) pair: resolve the adapter that received the
@@ -760,7 +903,11 @@ class GatewaySlashCommandsMixin(
         if args == "leave":
             return await self._handle_voice_channel_leave(event)
         if args == "status":
+            # The panel is the richer status view (buttons included), so prefer it where it exists.
+            notice = await self._voice_panel_auto_join(event)
             mode = self._voice_mode.get(voice_key, "off")
+            if await self._try_send_voice_panel(event, mode, notice=notice):
+                return None
             label = t(f"gateway.voice.label_{mode}") if mode in ("off", "voice_only", "all") else mode
             lines = [t("gateway.voice.status_mode", label=label)]
             guild_id = self._get_guild_id(event)  # append voice channel info if connected
@@ -772,6 +919,13 @@ class GatewaySlashCommandsMixin(
                     status = t("gateway.voice.speaking") if m.get("is_speaking") else ""
                     lines.append(t("gateway.voice.status_member", name=m['display_name'], status=status))
             return "\n".join(lines)
+
+        # Bare /voice and /vc: hop into the caller's voice channel first (this is the "be in VC,
+        # run the command, bot joins" flow), then show the panel with the result on its status line.
+        notice = await self._voice_panel_auto_join(event)
+        current = self._voice_mode.get(voice_key, "off")
+        if await self._try_send_voice_panel(event, current, notice=notice):
+            return None
 
         # Toggle: off → on, on/all → off
         turning_on = self._voice_mode.get(voice_key, "off") == "off"

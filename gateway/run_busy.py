@@ -1163,9 +1163,13 @@ class GatewayBusySessionMixin:
 
     async def _busy_start_command(self, event: MessageEvent, quick_key: str, source):
         # Telegram's /start is a platform ping (bot launch/deep-link), not a user command.
+        # Everywhere else /start is Hermes' own free-response toggle and must still run mid-turn.
+        if source.platform == Platform.TELEGRAM:
+            await _busy_accepted()
+            logger.info("Ignoring /start platform ping for active session %s", quick_key)
+            return ""
         await _busy_accepted()
-        logger.info("Ignoring /start platform ping for active session %s", quick_key)
-        return ""
+        return await self._handle_start_command(event)
 
     async def _busy_egress_command(self, event: MessageEvent, quick_key: str, source):
         from hermes_cli.proxy_cli import format_status_text

@@ -4828,6 +4828,12 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             tree.command(name=name, description=description)(
                 self._slash_proxy(name, args, template, followup, strip=name != "insights")
             )
+        # /sesh + /nitesesh (embed UI) live in nitesesh_ui.py; failure here must never break startup.
+        try:
+            from plugins.platforms.discord import nitesesh_ui
+            nitesesh_ui.register(self, tree)
+        except Exception as e:
+            logger.warning("nitesesh UI not registered: %s", e)
         # Auto-register COMMAND_REGISTRY + plugin commands not yet on the tree. Native
         # commands above always survive the 100-command cap; reserve one slot for /skill.
         already_registered: set[str] = set()

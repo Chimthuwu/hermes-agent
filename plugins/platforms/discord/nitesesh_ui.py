@@ -31,6 +31,7 @@ SETTINGS_PATH = "Z:/HERMES/.hermes/nitesesh/settings.json"
 DISCOVER_SCRIPT = "Z:/HERMES/.hermes/scripts/discover-todo-projects.py"
 RUNNER_SCRIPT = "Z:/HERMES/.hermes/scripts/nitesesh-run.py"
 RUNS_DIR = "Z:/HERMES/.hermes/nitesesh/runs"
+PAGE_SIZE = 25  # Discord select-menu hard cap
 
 
 def _load_settings() -> Dict[str, Any]:
@@ -74,6 +75,7 @@ class SeshPanel:
     def __init__(self) -> None:
         self.selected: set[str] = set()
         self.reveal = False
+        self.page = 0
         self.projects: List[Dict[str, Any]] = []
         self.discovered = False
 
@@ -92,17 +94,25 @@ class SeshPanel:
             ("Thread output", "off" if settings.get("thread_style", "raw") == "raw" else "on"),
         ]
 
+    def page_count(self) -> int:
+        return max(1, (len(self.projects) + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    def page_projects(self) -> List[Dict[str, Any]]:
+        start = self.page * PAGE_SIZE
+        return self.projects[start:start + PAGE_SIZE]
+
     def build_embed(self) -> "discord.Embed":
         settings = _load_settings()
         lines: List[str] = []
-        for proj in self.projects:
+        for proj in self.page_projects():
             name = _mask(proj["name"], self.reveal)
             n = proj.get("open_tasks", 0)
             warn = "" if proj.get("is_git") else " · no git"
             tick = "✅ " if proj["name"] in self.selected else ""
             lines.append(f"{tick}**{name}** — {n} open{warn}")
         if not lines:
-            lines = ["(discovering projects…)"]
+            lines = ["(no projects on this page)"]
+        total = len(self.projects)
         embed = discord.Embed(
             title="/sesh — pick projects to work on",
             description="\n".join(lines)[:4000],
@@ -110,21 +120,103 @@ class SeshPanel:
         )
         for label, value in self.status_fields():
             embed.add_field(name=label, value=value, inline=True)
-        embed.set_footer(text=f"Pushes: {'on' if settings.get('push', True) else 'off'} · "
-                              f"time cap {settings.get('run_time_cap_min', 360)} min · "
-                              f"cost cap ${settings.get('run_cost_cap_usd', 3)} · "
-                              "Tick projects, then Start run")
+        embed.set_footer(text=f"Page {self.page + 1}/{self.page_count()} · "
+                              f"{total} project(s) total · "
+                              "Tick projects on any page, then Start run")
         return embed
 
     def chosen_arg(self) -> str:
         return ";".join(sorted(self.selected))
 
 
+class SettingsModal(discord.ui.Modal, title="⚙️ sesh settings"):
+    """Edit key nitesesh settings.json fields and save back to disk."""
+
+    def __init__(self, settings: Dict[str, Any]) -> None:
+        super().__init__()
+        self.settings = settings
+
+        self.model = discord.ui.TextInput(
+            label="Worker model",
+            placeholder="e.g. hermes:nous:reflection/beam-1.0-501b-a23b:free",
+            default=str(settings.get("worker_default", ""))[:4000],
+            required=False,
+            max_length=4000,
+        )
+        self.add_item(self.model)
+
+        self.time_cap = discord.ui.TextInput(
+            label="Time cap (minutes)",
+            default=str(settings.get("run_time_cap_min", 360))[:50],
+            required=True,
+            max_length=10,
+        )
+        self.add_item(self.time_cap)
+
+        self.cost_cap = discord.ui.TextInput(
+            label="Cost cap (USD)",
+            default=str(settings.get("run_cost_cap_usd", 3))[:50],
+            required=True,
+            max_length=10,
+        )
+        self.add_item(self.cost_cap)
+
+        self.max_tasks = discord.ui.TextInput(
+            label="Max tasks per project",
+            default=str(settings.get("max_tasks_per_project", 999))[:50],
+            required=True,
+            max_length=10,
+        )
+        self.add_item(self.max_tasks)
+
+        self.push = discord.ui.TextInput(
+            label="Push on/off (true/false)",
+            default="true" if settings.get("push", True) else "false",
+            required=True,
+            max_length=10,
+        )
+        self.add_item(self.push)
+
+    async def on_submit(self, interaction: "discord.Interaction") -> None:
+        def _write() -> None:
+            s = dict(self.settings)
+            s["worker_default"] = self.model.value.strip() or s.get("worker_default", "")
+            try:
+                s["run_time_cap_min"] = int(self.time_cap.value.strip())
+            except ValueError:
+                pass
+            try:
+                s["run_cost_cap_usd"] = float(self.cost_cap.value.strip())
+            except ValueError:
+                pass
+            try:
+                s["max_tasks_per_project"] = int(self.max_tasks.value.strip())
+            except ValueError:
+                pass
+            s["push"] = self.push.value.strip().lower() in ("true", "1", "yes", "on")
+            import json
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
+                json.dump(s, fh, indent=2)
+
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _write)
+        except Exception as exc:
+            await interaction.response.send_message(f"❌ Failed to save settings: {exc}", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="⚙️ Settings saved",
+            description=f"Wrote to `{SETTINGS_PATH}`. Restart the gateway to apply the model change.",
+            colour=0x57F287,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 def _build_view(panel: SeshPanel) -> "discord.ui.View":
     assert discord is not None
 
     class ProjectSelect(discord.ui.Select):
-        def __init__(self) -> None:
+        def __init__(self, page: int) -> None:
+            page_projs = panel.page_projects()
             options = [
                 discord.SelectOption(
                     label=_mask(p["name"], panel.reveal)[:100],
@@ -132,26 +224,45 @@ def _build_view(panel: SeshPanel) -> "discord.ui.View":
                     description=f"{p.get('open_tasks', 0)} open tasks",
                     default=p["name"] in panel.selected,
                 )
-                for p in panel.projects[:25]
-            ] or [discord.SelectOption(label="No projects found", value="none")]
-            super().__init__(placeholder="Tick the projects you want…",
-                             min_values=0, max_values=len(options), options=options)
+                for p in page_projs
+            ] or [discord.SelectOption(label="No projects on this page", value="none")]
+            super().__init__(
+                placeholder=f"Tick projects on page {panel.page + 1}/{panel.page_count}…",
+                min_values=0,
+                max_values=len(options),
+                options=options,
+            )
 
         async def callback(self, interaction: "discord.Interaction") -> None:
-            panel.selected = set(self.values) - {"none"}
-            await interaction.response.edit_message(embed=panel.build_embed(), view=view)
+            panel.selected = (panel.selected - {p["name"] for p in panel.page_projects()}) | (
+                set(self.values) - {"none"}
+            )
+            await interaction.response.edit_message(embed=panel.build_embed(), view=_build_view(panel))
 
     class SeshView(discord.ui.View):
         def __init__(self) -> None:
             super().__init__(timeout=None)
-            self.add_item(ProjectSelect())
+            self.add_item(ProjectSelect(panel.page))
+
+        @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=2)
+        async def prev_page(self, interaction: "discord.Interaction", _btn: "discord.ui.Button") -> None:
+            if panel.page > 0:
+                panel.page -= 1
+            await interaction.response.edit_message(embed=panel.build_embed(), view=_build_view(panel))
+
+        @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary, row=2)
+        async def next_page(self, interaction: "discord.Interaction", _btn: "discord.ui.Button") -> None:
+            if panel.page < panel.page_count() - 1:
+                panel.page += 1
+            await interaction.response.edit_message(embed=panel.build_embed(), view=_build_view(panel))
 
         @discord.ui.button(label="Refresh list", style=discord.ButtonStyle.secondary, row=2)
         async def refresh(self, interaction: "discord.Interaction", _btn: "discord.ui.Button") -> None:
             await interaction.response.defer()
             await asyncio.get_event_loop().run_in_executor(None, panel.refresh_projects)
             panel.selected &= {p["name"] for p in panel.projects}
-            await interaction.edit_original_response(embed=panel.build_embed(), view=self)
+            panel.page = 0
+            await interaction.edit_original_response(embed=panel.build_embed(), view=_build_view(panel))
 
         @discord.ui.button(label="Clear", style=discord.ButtonStyle.secondary, row=2)
         async def clear(self, interaction: "discord.Interaction", _btn: "discord.ui.Button") -> None:
@@ -166,15 +277,8 @@ def _build_view(panel: SeshPanel) -> "discord.ui.View":
         @discord.ui.button(label="Settings", style=discord.ButtonStyle.secondary, row=3)
         async def settings_btn(self, interaction: "discord.Interaction", _btn: "discord.ui.Button") -> None:
             s = _load_settings()
-            text = (f"push: {s.get('push')} · auto_commit_dirty: {s.get('auto_commit_dirty')} · "
-                    f"use_branches: {s.get('use_branches')}\n"
-                    f"time cap: {s.get('run_time_cap_min')} min · cost cap: ${s.get('run_cost_cap_usd')} · "
-                    f"max parallel: {s.get('max_parallel_workers')}\n"
-                    f"model: {s.get('worker_default')}\n"
-                    f"settings file: {SETTINGS_PATH}")
-            embed = discord.Embed(title="/sesh — settings", description=text, colour=0x57F287)
-            embed.set_footer(text="Edit settings.json (or /nitesesh panel) to change these.")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            modal = SettingsModal(s)
+            await interaction.response.send_modal(modal)
 
         @discord.ui.button(label="Start run", style=discord.ButtonStyle.success, row=3)
         async def start(self, interaction: "discord.Interaction", _btn: "discord.ui.Button") -> None:
